@@ -345,6 +345,7 @@ dependencies = [
  "aes",
  "anyhow",
  "argon2",
+ "base64",
  "clap",
  "ctrlc",
  "luks-core",

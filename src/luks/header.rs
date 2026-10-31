@@ -67,15 +67,10 @@ pub enum Detect {
 pub fn detect<R: Read + Seek>(reader: &mut R) -> std::io::Result<Detect> {
     let mut first = [0u8; 512];
     reader.seek(SeekFrom::Start(0))?;
-    let mut filled = 0;
-    while filled < first.len() {
-        let n = reader.read(&mut first[filled..])?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    let bytes = &first[..filled];
+    // A target smaller than 512 bytes cannot carry a LUKS2 header;
+    // read_exact's UnexpectedEof names that cleanly.
+    reader.read_exact(&mut first)?;
+    let bytes = &first;
     if bytes.get(..6) == Some(&MAGIC_1ST[..]) || bytes.get(..6) == Some(&MAGIC_2ND[..]) {
         let version = u16::from_be_bytes(
             bytes
@@ -157,17 +152,9 @@ impl HeaderPolicy {
 fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     reader.seek(SeekFrom::Start(offset))?;
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = reader.read(&mut buf[filled..])?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("short read at offset {offset}: {filled} of {len} bytes"),
-            ));
-        }
-        filled += n;
-    }
+    reader.read_exact(&mut buf).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("short read at offset {offset}: {e}"))
+    })?;
     Ok(buf)
 }
 
