@@ -149,6 +149,51 @@ Watch mode (foreground variant of the service, useful for dev / debugging):
 ext4 watch                                  # foreground; logs each arrival
 ```
 
+## Encrypted (LUKS2) volumes
+
+A disk or image whose volume starts with a LUKS2 header opens like any
+other: the tool detects it, prints
+`LUKS2 volume detected (LUKS2, aes-xts-plain64, sector size 512) — unlock with passphrase to mount read-only`,
+prompts for the passphrase (hidden input), and mounts the ext4
+filesystem inside **read-only**.
+
+- **Read-only, always.** A LUKS volume is never mounted writable
+  through this tool; `--rw` on one is an error. The ext4 layer reads
+  through a decrypting block source and cannot reach the ciphertext's
+  write path at all.
+- **Passphrase keyslots only.** Unlock tries every `luks2`-type
+  keyslot with a passphrase KDF (argon2id, argon2i, pbkdf2). TPM,
+  FIDO2, PKCS#11 and other token keyslots are ignored — a volume that
+  also carries a passphrase slot still opens.
+- **Refused, with a clear message:** LUKS1 (older format, not
+  supported), data-integrity (dm-integrity) volumes, unknown
+  cipher/mode/segment types (never guess-decrypted), and a damaged
+  header whose backup copy is unreadable too.
+- **Non-interactive use:** `--passphrase-file <file>` (one line) or a
+  piped stdin passphrase. Caveat: the file's blocks are not wiped
+  after reading — intended for services and CI, not for secrets you
+  mind leaving on the disk.
+- **Key hygiene:** the passphrase and all derived key material are
+  held in zeroized buffers, never logged, never written anywhere by
+  this tool.
+
+The unlock pipeline (header parse, KDF, keyslot decrypt, AF merge,
+digest verification, sector decryption at 512 and 4096 bytes) is the
+[`luks-core`](https://crates.io/crates/luks-core) crate, pinned at
+0.1.8: pure Rust, `forbid(unsafe)`, and validated sector-for-sector
+against `cryptsetup` 2.7 by its authors. This repository adds the
+format policy (what it will attempt, each refusal a named error),
+secondary-header recovery, and the WinFsp-side wiring. Correctness of
+the whole chain is checked in CI by a differential test: `cryptsetup`
+mints fixture volumes with a known file manifest, and the driver's
+reads are compared against the SHA256 sums recorded on Linux
+(`tests/luks_oracle.rs`, fixtures from `tools/fixtures/gen.sh`).
+
+License note: `luks-core` is Apache-2.0, which is one-way compatible
+with this repository's GPL-3.0-or-later: we may link and distribute
+the combination under GPL-3.0-or-later, with the crate's own license
+continuing to govern its source.
+
 ## The skeleton split
 
 After v0.1.0 was working end-to-end, the platform plumbing was

@@ -18,6 +18,19 @@ path = "src/main.rs"
 rust-fs-ext4 = { path = "../rust-fs-ext4", version = "0.8" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# LUKS2 unlock + sector decrypt. Pure Rust, no unsafe, validated
+# sector-for-sector against cryptsetup 2.7 (SecurityRonin/luks-forensic).
+# Pinned exactly: the header parser, KDF dispatch, AF-merge and XTS
+# paths this driver leans on are the ones that oracle validated.
+# Apache-2.0, one-way compatible with this crate's GPL-3.0-or-later.
+luks-core = "=0.1.8"
+# Passphrase and key material are zeroized on drop; never logged.
+zeroize = "1"
+# Hidden passphrase prompt for interactive unlocks.
+rpassword = "7"
+# LUKS2 metadata checksum verification (digest comparison only).
+sha2 = "0.10"
+serde_json = "1"
 # winfsp-fs-skeleton owns the SCM dispatcher, disk-arrival event pump,
 # partition walker, raw-device I/O with sector alignment, and drive-
 # letter selection. We supply only the ext4-specific superblock-magic
@@ -90,8 +103,22 @@ widestring = { version = "1", optional = true }
 # `delayload` implies the `build` feature in winfsp's Cargo.toml.
 winfsp = { path = "../winfsp-rs/winfsp", features = ["delayload"], default-features = false }
 
+[dev-dependencies]
+# The Tier-1 mint in src/luks/tests.rs reuses the exact RustCrypto
+# primitives the unlock path uses, in reverse, to build self-minted
+# containers. Versions aligned with luks-core's own pins.
+aes = "0.8"
+xts-mode = "0.5"
+pbkdf2 = "0.12"
+argon2 = "0.5"
+base64 = "0.22"
+
 [features]
 default = []
+# Empty of production code: only gates the LUKS oracle/e2e integration
+# tests, whose prerequisites (cryptsetup fixtures, mkfs.ext4) the CI
+# luks job provisions. Nothing in src/ may depend on it.
+luks-oracle = []
 # Enables the `mount` subcommand (WinFsp driver). Active only on Windows
 # — on other targets the deps don't resolve and the cfg-gated code is
 # absent.

@@ -18,6 +18,7 @@ fn parse_hex_or_dec(s: &str) -> Result<u32, String> {
 use winfsp_fs_skeleton::FsBackend;
 
 mod cmd;
+mod luks;
 mod mount;
 mod probe;
 
@@ -57,6 +58,10 @@ struct Cli {
 /// arrives without a partition table -- it always passes `--part`
 /// because the WinFsp.Launcher CommandLine template is fixed, and
 /// uses 0 to mean "open the whole device as the ext4 fs".
+///
+/// `passphrase_file` unlocks a LUKS2-encrypted target non-interactively;
+/// without it a LUKS2 target prompts for the passphrase (hidden input),
+/// or reads it from stdin when stdin is not a terminal.
 #[derive(Args, Clone)]
 struct MountArgs {
     /// Disk image, ext4 filesystem image, or (Windows) raw device.
@@ -66,6 +71,11 @@ struct MountArgs {
     /// the same as omitting the flag.
     #[arg(long, short = 'p')]
     part: Option<usize>,
+    /// Read the LUKS2 unlock passphrase from this file (one line).
+    /// Security caveat: the passphrase transits the filesystem and
+    /// the file's blocks are not wiped; intended for services and CI.
+    #[arg(long)]
+    passphrase_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]

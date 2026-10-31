@@ -53,6 +53,12 @@ unsafe impl Sync for Mount {}
 
 impl Mount {
     pub fn open(mt: &MountArgs) -> Result<Self> {
+        // A LUKS volume (whole image or the chosen partition) opens
+        // through the decrypting source instead; everything else is
+        // the plain ext4 path.
+        if let Some(m) = Self::open_luks(mt)? {
+            return Ok(m);
+        }
         // Treat --part 0 as "no partition" (same as omitting the flag).
         // Lets the ExtFsWatcher service pass --part unconditionally
         // through the fixed WinFsp.Launcher CommandLine template.
@@ -62,10 +68,107 @@ impl Mount {
         }
     }
 
+    /// Open `mt` as a LUKS2 volume if the target carries a LUKS
+    /// header; `Ok(None)` when it does not. The header is read and
+    /// policy-validated first, the detection line is printed, the
+    /// passphrase is acquired (hidden prompt, `--passphrase-file`, or
+    /// piped stdin), and the ext4 filesystem inside is mounted
+    /// read-only through the decrypting block source.
+    ///
+    /// A LUKS1 volume is refused here with a clear message, as is a
+    /// damaged header with no recoverable backup — both are errors,
+    /// not falls-through to the plain path.
+    fn open_luks(mt: &MountArgs) -> Result<Option<Self>> {
+        use winfsp_fs_skeleton::device::BlockSource;
+
+        let src: Arc<dyn BlockSource> = Arc::new(FileSource::open(&mt.image)?);
+        // The LUKS container is the whole image, or the chosen
+        // partition slice within it.
+        let base = match mt.part {
+            None | Some(0) => 0,
+            Some(n) => {
+                let parts = partition::list_from_source(src.as_ref())
+                    .with_context(|| format!("listing partitions in {:?}", mt.image))?;
+                if n == 0 || n > parts.len() {
+                    bail!("--part {n} out of range (1..={})", parts.len());
+                }
+                parts[n - 1].start_lba * 512
+            }
+        };
+
+        // Not LUKS at all: back to the plain ext4 path.
+        if !crate::luks::LuksSource::detect_at(src.as_ref(), base)
+            .with_context(|| format!("probing {:?} for a LUKS header", mt.image))?
+        {
+            return Ok(None);
+        }
+
+        // LUKS magic present: version check first (LUKS1 is refused
+        // with its own message), then the full header read, which
+        // covers secondary-header recovery and format policy.
+        let mut reader = crate::luks::source::BlockReader::new(Arc::clone(&src), base);
+        match crate::luks::header::detect(&mut reader)? {
+            crate::luks::header::Detect::Luks1 => {
+                bail!("{}", crate::luks::LuksError::Luks1Unsupported);
+            }
+            crate::luks::header::Detect::NotLuks => return Ok(None),
+            crate::luks::header::Detect::Luks2 => {}
+        }
+        let policy = crate::luks::header::read_header(&mut reader).map_err(|e| anyhow!("{e}"))?;
+        let facts = policy.facts();
+        eprintln!(
+            "LUKS2 volume detected (LUKS2, {}, sector size {}) — unlock with passphrase to mount read-only",
+            facts.encryption, facts.sector_size
+        );
+
+        let passphrase = crate::luks::passphrase::acquire(mt.passphrase_file.as_deref(), true)
+            .context("reading the passphrase")?;
+        let luks = crate::luks::LuksSource::open(Arc::clone(&src), base, &passphrase)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        // ext4 inside: the decrypting source is the block device the
+        // C ABI reads through, at payload offset 0.
+        let len = luks.size();
+        let ctx = Box::new(SliceCtx {
+            src: Arc::new(luks),
+            base: 0,
+            len,
+        });
+        let raw = Box::into_raw(ctx);
+        let cfg = fs_ext4_blockdev_cfg_t {
+            read: Some(slice_read_cb),
+            context: raw as *mut c_void,
+            size_bytes: len,
+            // 0 = let the driver discover from the superblock.
+            block_size: 0,
+            write: None,
+            flush: None,
+        };
+        let fs = unsafe { fs_ext4_mount_with_callbacks(&cfg) };
+        if fs.is_null() {
+            unsafe { drop(Box::from_raw(raw)) };
+            bail!(
+                "the unlocked volume does not contain a readable ext4 \
+                 filesystem (payload {len} bytes): {}",
+                crate::cmd::last_err()
+            );
+        }
+        Ok(Some(Self {
+            fs,
+            cb_ctx: Some(raw),
+            writable: false,
+        }))
+    }
+
     /// Same dispatch as [`open`] but routes to RW variants. Currently
     /// only `--part N` is wired for RW (the WinFsp mount path). A direct
     /// (whole-image) RW open could be added later but isn't needed
     /// for the WinFsp use case where partition mounts dominate.
+    ///
+    /// A LUKS volume never opens RW, on any path: the refusal is
+    /// checked here, before the plain paths, so `--rw` on an
+    /// encrypted volume is a clear error rather than a writable
+    /// mount of the underlying device.
     ///
     /// Gated on `windows + feature = "mount"` because the only caller is
     /// the `Cmd::Mount` arm in `main.rs`, which has the same gate.
@@ -73,6 +176,7 @@ impl Mount {
     /// openers as dead code.
     #[cfg(all(windows, feature = "mount"))]
     pub fn open_rw(mt: &MountArgs) -> Result<Self> {
+        Self::refuse_luks_rw(mt)?;
         match mt.part {
             None | Some(0) => Self::open_direct_rw(&mt.image),
             Some(n) => Self::open_partition_rw(&mt.image, n),
@@ -81,10 +185,45 @@ impl Mount {
 
     // On non-Windows (macOS dev/test builds), RW operations are not
     // supported by the underlying C library. Fall back to read-only so
-    // the binary compiles for host-side smoke tests.
+    // the binary compiles for host-side smoke tests. A LUKS volume is
+    // still refused here — RO-only is the one rule that holds on
+    // every platform.
     #[cfg(not(all(windows, feature = "mount")))]
     pub fn open_rw(mt: &MountArgs) -> Result<Self> {
+        Self::refuse_luks_rw(mt)?;
         Self::open(mt)
+    }
+
+    /// `--rw` against a LUKS volume: a named refusal, before anything
+    /// is opened for writing. A LUKS volume mounted through this tool
+    /// is read-only end to end.
+    fn refuse_luks_rw(mt: &MountArgs) -> Result<()> {
+        use winfsp_fs_skeleton::device::BlockSource;
+        let src = match FileSource::open(&mt.image) {
+            Ok(s) => Arc::new(s) as Arc<dyn BlockSource>,
+            // The plain paths will report an unreadable target with
+            // their own context; this probe need not duplicate it.
+            Err(_) => return Ok(()),
+        };
+        let base = match mt.part {
+            None | Some(0) => 0,
+            Some(n) => {
+                let Ok(parts) = partition::list_from_source(src.as_ref()) else {
+                    return Ok(());
+                };
+                let Some(p) = parts.get(n.wrapping_sub(1)) else {
+                    return Ok(());
+                };
+                p.start_lba * 512
+            }
+        };
+        if crate::luks::LuksSource::detect_at(src.as_ref(), base).unwrap_or(false) {
+            bail!(
+                "an encrypted (LUKS) volume is always mounted read-only; \
+                 rerun without --rw"
+            );
+        }
+        Ok(())
     }
 
     /// RW analogue of [`open_direct`] — uses `fs_ext4_mount_rw` against the
