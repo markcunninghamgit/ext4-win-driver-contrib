@@ -268,6 +268,65 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     uses: ./.github/workflows/matrix.yml
 
+  # The LUKS2 differential test: cryptsetup mints the fixtures, the
+  # oracle test reads them back through this driver. The whole point
+  # is an oracle that is not us, so the fixtures are regenerated with
+  # a pinned cryptsetup on every run rather than trusted from a cache.
+  luks:
+    name: luks fixtures + differential test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check out sibling repos
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^  $1: *//p" chores.yml | tr -d '\r'; }
+          git init --quiet ../rust-fs-core
+          git -C ../rust-fs-core remote add origin "$(pin FS_CORE_URL)"
+          git -C ../rust-fs-core fetch --quiet --depth 1 origin "$(pin FS_CORE_REF)"
+          git -C ../rust-fs-core checkout --quiet FETCH_HEAD
+
+      - name: pin cryptsetup
+        run: |
+          sudo apt-get update
+          # The oracle's version is recorded in the fixture manifest
+          # directory README; a drift here is a finding, not a pass.
+          sudo apt-get install -y cryptsetup e2fsprogs
+          cryptsetup --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: generate fixtures
+        run: |
+          sudo chmod +x tools/fixtures/gen.sh
+          sudo tools/fixtures/gen.sh "$PWD/fixtures/luks"
+
+      - name: differential test
+        env:
+          LUKS_FIXTURE_DIR: ${{ github.workspace }}/fixtures/luks
+        run: bash ../rust-fs-core/scripts/tier.sh --refuse-skips test-luks -- cargo test --locked --no-default-features --test luks_oracle
+
+      - name: upload fixtures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luks-fixtures
+          path: fixtures/luks/
+          if-no-files-found: error
+
+      - name: upload tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-luks
+          path: tmp/logs/
+          if-no-files-found: warn
+
   # THE ONE REQUIRED CHECK. Branch protection names this job instead of each
   # job above, so a job can be added, renamed or split without leaving a
   # required check that never reports. It accepts a skipped job only when
@@ -275,7 +334,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, matrix-schema, portable, windows, matrix]
+    needs: [changes, matrix-schema, portable, windows, matrix, luks]
     runs-on: ubuntu-latest
     steps:
       - name: every gating job must have concluded success
