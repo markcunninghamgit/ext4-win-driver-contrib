@@ -20,6 +20,20 @@ const MAGIC_1ST: [u8; 6] = [b'L', b'U', b'K', b'S', 0xba, 0xbe];
 const MAGIC_2ND: [u8; 6] = [b'S', b'K', b'U', b'L', 0xba, 0xbe];
 const BIN_HDR_LEN: usize = 4096;
 
+// Field offsets in the spec's binary header, mirroring the table in
+// src/luks/header.rs (kept in sync by the shared roundtrip tests).
+mod spec {
+    pub const MAGIC_LEN: usize = 6;
+    pub const VERSION_OFF: usize = 6;
+    pub const HDR_SIZE_OFF: usize = 8;
+    pub const SEQID_OFF: usize = 16;
+    pub const CSUM_ALG_OFF: usize = 72;
+    pub const HDR_OFFSET_OFF: usize = 256;
+    pub const CSUM_OFF: usize = 448;
+    pub const CSUM_LEN: usize = 64;
+    pub const BIN_USED_LEN: usize = 512;
+}
+
 /// An in-memory read-only block source over a byte vector.
 pub struct VecSource {
     pub data: Vec<u8>,
@@ -296,21 +310,22 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, len: usize)
 pub fn write_header(image: &mut [u8], json: &str, base: u64, magic: [u8; 6], g: Geometry) {
     let hdr_size = g.hdr_size as usize;
     let b = base as usize;
-    image[b..b + 6].copy_from_slice(&magic);
-    image[b + 6..b + 8].copy_from_slice(&2u16.to_be_bytes());
-    image[b + 8..b + 16].copy_from_slice(&(hdr_size as u64).to_be_bytes());
-    image[b + 16..b + 24].copy_from_slice(&1u64.to_be_bytes()); // seqid
-    image[b + 72..b + 78].copy_from_slice(b"sha256");
-    image[b + 256..b + 264].copy_from_slice(&base.to_be_bytes()); // hdr_offset
+    image[b..b + spec::MAGIC_LEN].copy_from_slice(&magic);
+    image[b + spec::VERSION_OFF..b + spec::VERSION_OFF + 2].copy_from_slice(&2u16.to_be_bytes());
+    image[b + spec::HDR_SIZE_OFF..b + spec::HDR_SIZE_OFF + 8]
+        .copy_from_slice(&(hdr_size as u64).to_be_bytes());
+    image[b + spec::SEQID_OFF..b + spec::SEQID_OFF + 8].copy_from_slice(&1u64.to_be_bytes());
+    image[b + spec::CSUM_ALG_OFF..b + spec::CSUM_ALG_OFF + 6].copy_from_slice(b"sha256");
+    image[b + spec::HDR_OFFSET_OFF..b + spec::HDR_OFFSET_OFF + 8].copy_from_slice(&base.to_be_bytes());
     let j = b + BIN_HDR_LEN;
     image[j..j + json.len()].copy_from_slice(json.as_bytes());
 
     let mut hasher = Sha256::new();
-    hasher.update(&image[b..b + 448]);
-    hasher.update([0u8; 64]);
-    hasher.update(&image[b + 512..b + hdr_size]);
+    hasher.update(&image[b..b + spec::CSUM_OFF]);
+    hasher.update([0u8; spec::CSUM_LEN]);
+    hasher.update(&image[b + spec::BIN_USED_LEN..b + hdr_size]);
     let csum = hasher.finalize();
-    image[b + 448..b + 480].copy_from_slice(&csum);
+    image[b + spec::CSUM_OFF..b + spec::CSUM_OFF + 32].copy_from_slice(&csum);
 }
 
 

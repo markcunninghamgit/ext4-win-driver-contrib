@@ -26,8 +26,38 @@ pub(crate) const MAGIC_2ND: [u8; 6] = [b'S', b'K', b'U', b'L', 0xba, 0xbe];
 /// The binary header occupies one 4096-byte sector (512 used).
 pub(crate) const BIN_HDR_LEN: usize = 4096;
 
-/// Offset of `hdr_offset` in the binary header (per the spec struct).
-const HDR_OFFSET_OFF: usize = 256;
+/// Byte offsets of the fields of the spec's `luks2_hdr_disk` struct,
+/// in the binary header sector. The struct is packed and
+/// big-endian; the offsets are the running sums of its members:
+/// magic 6, version 2, hdr_size 8, seqid 8, label 48, csum_alg 32,
+/// salt 64, uuid 40, subsystem 48, hdr_offset 8, _padding 184,
+/// csum 64 — filling the 512 used bytes of the 4096-byte sector.
+///
+/// The table mirrors the whole struct so the layout reads in one
+/// place; production reads a subset of the fields and the fixtures
+/// write more of them, so the not-yet-read constants are allowed to
+/// sit.
+#[allow(dead_code)]
+mod spec {
+    pub const MAGIC_OFF: usize = 0;
+    pub const MAGIC_LEN: usize = 6;
+    pub const VERSION_OFF: usize = 6;
+    pub const HDR_SIZE_OFF: usize = 8;
+    pub const SEQID_OFF: usize = 16;
+    pub const LABEL_OFF: usize = 24;
+    pub const LABEL_LEN: usize = 48;
+    pub const CSUM_ALG_OFF: usize = 72;
+    pub const SALT_OFF: usize = 104;
+    pub const UUID_OFF: usize = 168;
+    pub const SUBSYSTEM_OFF: usize = 208;
+    pub const HDR_OFFSET_OFF: usize = 256;
+    pub const PADDING_OFF: usize = 264;
+    pub const PADDING_LEN: usize = 184;
+    pub const CSUM_OFF: usize = 448;
+    pub const CSUM_LEN: usize = 64;
+    /// The used bytes of the binary header's 4096-byte sector.
+    pub const BIN_USED_LEN: usize = 512;
+}
 
 /// The fixed offsets the LUKS2 spec allows for the secondary header
 /// (its Table 1: 16 KiB .. 4 MiB, one row each power of two). The
@@ -161,8 +191,8 @@ fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, len: usize) -> std::io::
 /// The header area (binary header + JSON) one of the two headers
 /// occupies: `hdr_size` bytes starting at `base`.
 fn read_header_area<R: Read + Seek>(reader: &mut R, base: u64) -> std::io::Result<Vec<u8>> {
-    let bin = read_at(reader, base, 512)?;
-    let hdr_size = be_u64(&bin, 8);
+    let bin = read_at(reader, base, spec::BIN_USED_LEN)?;
+    let hdr_size = be_u64(&bin, spec::HDR_SIZE_OFF);
     if !(BIN_HDR_LEN as u64..=0x400000).contains(&hdr_size) || !hdr_size.is_multiple_of(4096) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -170,7 +200,7 @@ fn read_header_area<R: Read + Seek>(reader: &mut R, base: u64) -> std::io::Resul
         ));
     }
     let mut area = read_at(reader, base, hdr_size as usize)?;
-    area[..512].copy_from_slice(&bin);
+    area[..spec::BIN_USED_LEN].copy_from_slice(&bin);
     Ok(area)
 }
 
@@ -180,17 +210,15 @@ fn read_header_area<R: Read + Seek>(reader: &mut R, base: u64) -> std::io::Resul
 /// digest comparison using `sha2` — no crypto of ours.
 fn checksum_matches(area: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
-    const CSUM_OFF: usize = 448;
-    const CSUM_LEN: usize = 64;
-    let Some(stored) = area.get(CSUM_OFF..CSUM_OFF + CSUM_LEN) else {
+    let Some(stored) = area.get(spec::CSUM_OFF..spec::CSUM_OFF + spec::CSUM_LEN) else {
         return false;
     };
     let mut hasher = Sha256::new();
-    hasher.update(&area[..CSUM_OFF]);
-    hasher.update([0u8; CSUM_LEN]);
+    hasher.update(&area[..spec::CSUM_OFF]);
+    hasher.update([0u8; spec::CSUM_LEN]);
     // The rest of the binary sector (padding past the checksum) plus
     // the JSON area are all covered too.
-    hasher.update(&area[CSUM_OFF + CSUM_LEN..]);
+    hasher.update(&area[spec::CSUM_OFF + spec::CSUM_LEN..]);
     let computed = hasher.finalize();
     stored[..32] == computed[..]
 }
@@ -294,8 +322,8 @@ pub fn read_header<R: Read + Seek>(reader: &mut R) -> Result<HeaderPolicy, LuksE
     // intact even when the JSON area is not — then every fixed
     // offset the spec allows.
     let mut candidates: Vec<u64> = Vec::new();
-    if let Ok(bin) = read_at(reader, 0, 512) {
-        let hdr_size = be_u64(&bin, 8);
+    if let Ok(bin) = read_at(reader, 0, spec::BIN_USED_LEN) {
+        let hdr_size = be_u64(&bin, spec::HDR_SIZE_OFF);
         if (BIN_HDR_LEN as u64..=0x400000).contains(&hdr_size) && hdr_size.is_multiple_of(4096) {
             candidates.push(hdr_size);
         }
@@ -317,10 +345,10 @@ pub fn read_header<R: Read + Seek>(reader: &mut R) -> Result<HeaderPolicy, LuksE
         };
         // The backup header's magic is SKUL, not LUKS; the parse takes
         // either. hdr_offset inside it must name its own base.
-        if be_u64(&area, HDR_OFFSET_OFF) != base {
+        if be_u64(&area, spec::HDR_OFFSET_OFF) != base {
             last_detail = format!(
                 "secondary header at offset {base} claims offset {}",
-                be_u64(&area, 408)
+                be_u64(&area, spec::HDR_OFFSET_OFF)
             );
             continue;
         }
@@ -346,26 +374,24 @@ mod tests {
     fn build_area(json: &str, base: u64, magic: [u8; 6]) -> Vec<u8> {
         let hdr_size = 0x4000u64;
         let mut area = vec![0u8; hdr_size as usize];
-        area[..6].copy_from_slice(&magic);
-        area[6..8].copy_from_slice(&2u16.to_be_bytes());
-        area[8..16].copy_from_slice(&hdr_size.to_be_bytes());
-        area[16..24].copy_from_slice(&1u64.to_be_bytes()); // seqid
-                                                           // csum_alg is 32 bytes (offset 24); uuid 40 bytes (offset 168),
-                                                           // per the spec's struct: magic 6, version 2, hdr_size 8, seqid 8,
-                                                           // label 48, csum_alg 32, salt 64, uuid 40, subsystem 48,
-                                                           // hdr_offset 8 (at 208+... = 232), padding 184, csum 64 at 384.
-        area[72..78].copy_from_slice(b"sha256"); // csum_alg
-        area[168..204].copy_from_slice(b"12345678-1234-1234-1234-123456789012"); // uuid
-        area[HDR_OFFSET_OFF..HDR_OFFSET_OFF + 8].copy_from_slice(&base.to_be_bytes());
+        use super::spec;
+        area[spec::MAGIC_OFF..spec::MAGIC_OFF + spec::MAGIC_LEN].copy_from_slice(&magic);
+        area[spec::VERSION_OFF..spec::VERSION_OFF + 2].copy_from_slice(&2u16.to_be_bytes());
+        area[spec::HDR_SIZE_OFF..spec::HDR_SIZE_OFF + 8].copy_from_slice(&hdr_size.to_be_bytes());
+        area[spec::SEQID_OFF..spec::SEQID_OFF + 8].copy_from_slice(&1u64.to_be_bytes());
+        area[spec::CSUM_ALG_OFF..spec::CSUM_ALG_OFF + 6].copy_from_slice(b"sha256");
+        area[spec::UUID_OFF..spec::UUID_OFF + 36]
+            .copy_from_slice(b"12345678-1234-1234-1234-123456789012");
+        area[spec::HDR_OFFSET_OFF..spec::HDR_OFFSET_OFF + 8].copy_from_slice(&base.to_be_bytes());
         area[BIN_HDR_LEN..BIN_HDR_LEN + json.len()].copy_from_slice(json.as_bytes());
         // Checksum over everything with csum zeroed.
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(&area[..448]);
-        hasher.update([0u8; 64]);
-        hasher.update(&area[512..]);
+        hasher.update(&area[..spec::CSUM_OFF]);
+        hasher.update([0u8; spec::CSUM_LEN]);
+        hasher.update(&area[spec::BIN_USED_LEN..]);
         let csum = hasher.finalize();
-        area[448..480].copy_from_slice(&csum);
+        area[spec::CSUM_OFF..spec::CSUM_OFF + 32].copy_from_slice(&csum);
         area
     }
 
@@ -388,8 +414,8 @@ mod tests {
     #[test]
     fn detects_luks1() {
         let mut buf = vec![0u8; 512];
-        buf[..6].copy_from_slice(&MAGIC_1ST);
-        buf[6..8].copy_from_slice(&1u16.to_be_bytes());
+        buf[..spec::MAGIC_LEN].copy_from_slice(&MAGIC_1ST);
+        buf[spec::VERSION_OFF..spec::VERSION_OFF + 2].copy_from_slice(&1u16.to_be_bytes());
         let mut c = std::io::Cursor::new(buf);
         assert_eq!(detect(&mut c).unwrap(), Detect::Luks1);
     }
