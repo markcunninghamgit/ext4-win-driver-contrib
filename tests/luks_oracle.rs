@@ -1,4 +1,10 @@
 //! Tier-2: the differential test against fixtures minted by real
+//
+// Runs only when the `luks-oracle` feature is on: its prerequisites
+// (cryptsetup-minted fixtures; mkfs.ext4/debugfs) exist only in the CI
+// luks job, and the portable suite must stay green on hosts without
+// them. The feature is empty of production code by design.
+#![cfg(feature = "luks-oracle")]
 //! `cryptsetup` on Linux, with a SHA256SUMS manifest written from
 //! inside the volume while it was mounted there.
 //!

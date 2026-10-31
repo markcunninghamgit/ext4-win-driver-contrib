@@ -114,6 +114,10 @@ argon2 = "0.5"
 
 [features]
 default = []
+# Empty of production code: only gates the LUKS oracle/e2e integration
+# tests, whose prerequisites (cryptsetup fixtures, mkfs.ext4) the CI
+# luks job provisions. Nothing in src/ may depend on it.
+luks-oracle = []
 # Enables the `mount` subcommand (WinFsp driver). Active only on Windows
 # — on other targets the deps don't resolve and the cfg-gated code is
 # absent.

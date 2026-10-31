@@ -297,6 +297,7 @@ jobs:
           # directory README; a drift here is a finding, not a pass.
           sudo apt-get install -y cryptsetup e2fsprogs
           cryptsetup --version
+          mkfs.ext4 -V
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -309,7 +310,10 @@ jobs:
       - name: differential test
         env:
           LUKS_FIXTURE_DIR: ${{ github.workspace }}/fixtures/luks
-        run: bash ../rust-fs-core/scripts/tier.sh --refuse-skips test-luks -- cargo test --locked --no-default-features --test luks_oracle
+        run: bash ../rust-fs-core/scripts/tier.sh --refuse-skips test-luks -- cargo test --locked --no-default-features --features luks-oracle --test luks_oracle
+
+      - name: end-to-end (real ext4 inside a minted LUKS2, via the CLI)
+        run: bash ../rust-fs-core/scripts/tier.sh --refuse-skips test-luks-e2e -- cargo test --locked --no-default-features --features luks-oracle --test luks_ext4_e2e
 
       - name: upload fixtures
         if: always()

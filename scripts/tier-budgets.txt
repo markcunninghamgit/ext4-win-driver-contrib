@@ -53,3 +53,6 @@ matrix          660  39900
 # a few compile lines cold; measured estimate 20 / 1,200, budget a
 # third over. Corrected with a measured value after the first CI run.
 test-luks         27   1600
+# The e2e tier: mkfs.ext4 + three passphrase containers + CLI reads;
+# measured estimate 5 / 300, to be corrected from the first CI run.
+test-luks-e2e      7    400
